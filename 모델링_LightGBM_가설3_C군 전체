@@ -1,0 +1,156 @@
+"""
+=============================================================================
+ C_effect_separate.py
+ C군(신규 비금융) 전체의 추가 기여를 '씬파일러 여부'와 '연령대'로 각각 분석
+=============================================================================
+ 실행 :  python C_effect_separate.py
+ 필요 :  pip install pandas numpy scikit-learn lightgbm scipy
+ 입력 :  같은 폴더에 model_A/B/C_*.csv
+
+ [ 검증 방법 ]
+   각 집단에서 C군 전체를 넣기 전/후의 AUC 차이(=C의 추가 기여)를 잰다.
+     M3 = A + B          (기준, C 없음)
+     M4 = A + B + C      (C 전체 추가)
+     ΔAUC = C의 순수 추가 기여  → DeLong 검정
+
+ [ C군 전체 = 사회연결망 + 교육 + 주거 + 자동차 ]
+   (앞서 '사회연결망만' 본 것과 달리, 여기서는 C군 전부를 넣는다)
+
+ [ 집단 구분 — 교차 없이 각각 따로 ]
+   (1) 씬파일러 여부 : 씬파일러 / 이력있음
+   (2) 연령대       : 20 / 30 / 40 / 50 / 60대
+
+ [ 모델 ]  LightGBM, 5-fold, DeLong
+ 출력 : C_effect_separate.csv
+=============================================================================
+"""
+
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from pandas.api.types import is_numeric_dtype
+from scipy import stats
+import lightgbm as lgb
+
+warnings.filterwarnings("ignore")
+
+# ==================== 설정 ====================
+FILE_A = "model_A_financial_final.csv"
+FILE_B = "model_B_nonfinancial_final.csv"
+FILE_C = "model_C_nonfinancial_new_final.csv"
+N_FOLDS = 5
+RANDOM_STATE = 42
+MIN_N, MIN_BAD = 2000, 80
+TREE_PARAMS = dict(n_estimators=400, learning_rate=0.03, num_leaves=31,
+                   colsample_bytree=0.8, subsample=0.9, subsample_freq=1,
+                   reg_lambda=1.0, min_child_samples=80, verbose=-1, n_jobs=-1)
+ID, TARGET = "SK_ID_CURR", "TARGET"
+
+
+# ==================== 로드 ====================
+def load():
+    A = pd.read_csv(FILE_A); B = pd.read_csv(FILE_B); C = pd.read_csv(FILE_C)
+    a = [c for c in A.columns if c not in (ID, TARGET)]
+    b = [c for c in B.columns if c not in (ID, TARGET)]
+    c = [c for c in C.columns if c not in (ID, TARGET)]
+    df = A.merge(B[[ID] + b], on=ID).merge(C[[ID] + c], on=ID)
+    for col in df.columns:
+        if df[col].dtype == bool:
+            df[col] = df[col].astype(int)
+    drop = [col for col in df.columns
+            if col not in (ID, TARGET) and not is_numeric_dtype(df[col])]
+    a = [x for x in a if x not in drop]
+    b = [x for x in b if x not in drop]
+    c = [x for x in c if x not in drop]
+    base = a + b            # M3 = A + B
+    full = a + b + c        # M4 = A + B + C
+    return df, base, full, len(c)
+
+
+# ==================== DeLong ====================
+def _mr(x):
+    J = np.argsort(x); Z = x[J]; N = len(x); T = np.zeros(N); i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1; i = j
+    o = np.empty(N); o[J] = T
+    return o
+
+
+def delong(y, s1, s2):
+    y = np.asarray(y); od = (-y).argsort(kind="mergesort"); m = int(y.sum())
+    p = np.vstack([np.asarray(s1)[od], np.asarray(s2)[od]]); n = p.shape[1] - m
+    tx = np.vstack([_mr(p[r, :m]) for r in range(2)])
+    ty = np.vstack([_mr(p[r, m:]) for r in range(2)])
+    tz = np.vstack([_mr(p[r, :]) for r in range(2)])
+    a = tz[:, :m].sum(1) / m / n - (m + 1) / 2 / n
+    cov = np.cov((tz[:, :m] - tx) / n) / m + np.cov(1 - (tz[:, m:] - ty) / m) / n
+    l = np.array([[1, -1]])
+    v = float(np.asarray(l @ np.atleast_2d(cov) @ l.T).ravel()[0])
+    dl = float(a[0] - a[1])
+    if v <= 0:
+        return dl, (1.0 if abs(dl) < 1e-12 else np.nan)
+    return dl, float(2 * (1 - stats.norm.cdf(abs(dl / np.sqrt(v)))))
+
+
+# ==================== 한 집단 분석 ====================
+def analyze(sub, name, base, full, rows):
+    y = sub[TARGET].values
+    if len(sub) < MIN_N or y.sum() < MIN_BAD:
+        print(f"  {name:20s} 표본부족 (n={len(sub)})")
+        return
+    folds = list(StratifiedKFold(N_FOLDS, shuffle=True,
+                                 random_state=RANDOM_STATE).split(sub, y))
+
+    def cv(cols):
+        X = sub[cols].replace([np.inf, -np.inf], np.nan)
+        oof = np.zeros(len(y))
+        for tr, va in folds:
+            m = lgb.LGBMClassifier(**TREE_PARAMS).fit(X.iloc[tr], y[tr])
+            oof[va] = m.predict_proba(X.iloc[va])[:, 1]
+        return oof
+
+    oof3 = cv(base)          # M3 = A+B
+    oof4 = cv(full)          # M4 = A+B+C
+    a3 = roc_auc_score(y, oof3)
+    a4 = roc_auc_score(y, oof4)
+    d, p = delong(y, oof4, oof3)
+    sig = "유의" if (p == p and p < 0.05) else "비유의"
+    print(f"  {name:20s} n={len(sub):6d} 부도율={y.mean():.1%}  "
+          f"M3(A+B)={a3:.4f} M4(A+B+C)={a4:.4f}  C추가ΔAUC={d:+.4f} p={p:.1e} {sig}")
+    rows.append({"집단": name, "표본수": len(sub), "부도율": round(y.mean(), 4),
+                 "M3_AB_AUC": round(a3, 4), "M4_ABC_AUC": round(a4, 4),
+                 "C추가_ΔAUC": round(d, 5), "DeLong_p": p, "유의성": sig})
+
+
+# ==================== 메인 ====================
+def main():
+    df, base, full, nc = load()
+    thin = df.BUREAU_NO_HISTORY_FLAG
+    age = df.AGE
+    print(f"전체 {len(df):,}행 | M3(A+B) {len(base)}개 | C군 {nc}개 추가 → M4 {len(full)}개\n")
+
+    rows = []
+    print("[1] 씬파일러 여부별 — C군 전체의 추가 기여 (M4 vs M3)")
+    print("-" * 95)
+    analyze(df, "전체", base, full, rows)
+    analyze(df[thin == 1], "씬파일러(이력없음)", base, full, rows)
+    analyze(df[thin == 0], "이력있음", base, full, rows)
+
+    print("\n[2] 연령대별 — C군 전체의 추가 기여 (M4 vs M3)")
+    print("-" * 95)
+    df["_decade"] = (age // 10 * 10).astype(int)
+    for dec in sorted(df["_decade"].unique()):
+        analyze(df[df._decade == dec], f"{dec}대", base, full, rows)
+
+    pd.DataFrame(rows).to_csv("C_effect_separate.csv", index=False,
+                              encoding="utf-8-sig")
+    print("\n저장: C_effect_separate.csv")
+
+
+if __name__ == "__main__":
+    main()
