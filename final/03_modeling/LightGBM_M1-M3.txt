@@ -1,0 +1,209 @@
+"""
+=============================================================================
+ model_M1_M3_fixed.py  —  M1~M3 신용평가 모델링 (LightGBM)
+ ★ 검증 fold 누수 제거 + scale_pos_weight 통일 + importance gain 명시
+=============================================================================
+ 실행 :  python model_M1_M3_fixed.py
+ 필요 :  pip install pandas numpy scikit-learn lightgbm scipy
+ 입력 :  같은 폴더에 3개 파일
+           model_A_financial_final.csv       (금융 + bureau)
+           model_B_nonfinancial_final.csv     (전통 비금융)
+           model_C_nonfinancial_new_final.csv (신규 비금융)
+
+ [ 모델 정의 ]
+   M1 = A       금융만 (베이스라인)
+   M2 = B       비금융 단독 (참고치, RQ 직접검증용 아님)
+   M3 = A + B   금융 + 비금융  → RQ1: 비금융을 더하면 예측력이 오르는가
+
+ [ 수정된 3가지 문제 ]
+   ① 검증 fold 누수 제거
+      - 기존: early stopping 기준으로 va(검증fold)를 쓰고 그 va를 예측 → 누수
+      - 수정: tr을 다시 나눠 early stopping 전용 검증셋(es)을 tr 내부에서 뽑음.
+              va는 오직 예측(채점)에만 사용 → 누수 없음
+   ② scale_pos_weight 통일 스위치 (USE_SCALE_POS_WEIGHT)
+      - 로지스틱이 balanced였다면 기법 간 처리를 맞춰야 공정.
+      - AUC(순위지표)가 목적이면 기본 False 권장.
+   ③ importance_type='gain' 명시 (기본값 split → gain)
+
+ [ 판정 지표 ]
+   - AUC / ΔAUC(M3-M1) / DeLong p (<0.05면 유의)
+
+ 출력 : results_M1_M3_fixed.csv, delong_M1_M3_fixed.csv, importance_M3_fixed.csv
+=============================================================================
+"""
+
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import roc_auc_score
+from pandas.api.types import is_numeric_dtype
+from scipy import stats
+import lightgbm as lgb
+
+warnings.filterwarnings("ignore")
+
+# ==================== 설정 ====================
+FILE_A = "model_A_financial_final.csv"
+FILE_B = "model_B_nonfinancial_final.csv"
+FILE_C = "model_C_nonfinancial_new_final.csv"
+N_FOLDS = 5          # 최종 5, 빠른 테스트 3
+SAMPLE_N = None      # None=전체 30만, 빠른 테스트는 150000
+RANDOM_STATE = 42
+EARLY_STOP = 80
+ES_SIZE = 0.2                    # ① tr에서 early stopping 검증셋으로 뗄 비율
+USE_SCALE_POS_WEIGHT = False     # ② 기법 간 통일 스위치 (AUC 목적이면 False)
+TREE_PARAMS = dict(n_estimators=1000, learning_rate=0.02, num_leaves=31,
+                   colsample_bytree=0.8, subsample=0.9, subsample_freq=1,
+                   reg_lambda=1.0, min_child_samples=100, verbose=-1, n_jobs=-1,
+                   importance_type="gain")   # ③ gain 명시
+ID, TARGET = "SK_ID_CURR", "TARGET"
+
+
+# ==================== 데이터 로드 & 병합 ====================
+def load_and_merge():
+    A = pd.read_csv(FILE_A)
+    B = pd.read_csv(FILE_B)
+    C = pd.read_csv(FILE_C)
+
+    a_cols = [c for c in A.columns if c not in (ID, TARGET)]
+    b_cols = [c for c in B.columns if c not in (ID, TARGET)]
+    c_cols = [c for c in C.columns if c not in (ID, TARGET)]
+
+    df = A.merge(B[[ID] + b_cols], on=ID, how="inner")
+    df = df.merge(C[[ID] + c_cols], on=ID, how="inner")
+
+    # bool → int
+    for c in df.columns:
+        if df[c].dtype == bool:
+            df[c] = df[c].astype(int)
+
+    # 비수치 컬럼 제외 (AGE_BAND 등; StringDtype도 걸러야 하므로 is_numeric_dtype)
+    drop_nonnum = [c for c in df.columns
+                   if c not in (ID, TARGET) and not is_numeric_dtype(df[c])]
+    if drop_nonnum:
+        print(f"  비수치 컬럼 제외: {drop_nonnum}")
+    a_cols = [c for c in a_cols if c not in drop_nonnum]
+    b_cols = [c for c in b_cols if c not in drop_nonnum]
+    c_cols = [c for c in c_cols if c not in drop_nonnum]
+
+    return df, a_cols, b_cols, c_cols
+
+
+# ==================== DeLong 검정 ====================
+def _mr(x):
+    J = np.argsort(x); Z = x[J]; N = len(x); T = np.zeros(N); i = 0
+    while i < N:
+        j = i
+        while j < N and Z[j] == Z[i]:
+            j += 1
+        T[i:j] = 0.5 * (i + j - 1) + 1; i = j
+    o = np.empty(N); o[J] = T
+    return o
+
+
+def delong(y, s1, s2):
+    """반환: (ΔAUC = AUC(s1)-AUC(s2), p_value)"""
+    y = np.asarray(y); od = (-y).argsort(kind="mergesort"); m = int(y.sum())
+    p = np.vstack([np.asarray(s1)[od], np.asarray(s2)[od]]); n = p.shape[1] - m
+    tx = np.vstack([_mr(p[r, :m]) for r in range(2)])
+    ty = np.vstack([_mr(p[r, m:]) for r in range(2)])
+    tz = np.vstack([_mr(p[r, :]) for r in range(2)])
+    a = tz[:, :m].sum(1) / m / n - (m + 1) / 2 / n
+    cov = np.cov((tz[:, :m] - tx) / n) / m + np.cov(1 - (tz[:, m:] - ty) / m) / n
+    l = np.array([[1, -1]])
+    v = float(np.asarray(l @ np.atleast_2d(cov) @ l.T).ravel()[0])
+    dl = float(a[0] - a[1])
+    if v <= 0:
+        return dl, (1.0 if abs(dl) < 1e-12 else np.nan)
+    z = dl / np.sqrt(v)
+    return dl, float(2 * (1 - stats.norm.cdf(abs(z))))
+
+
+# ==================== 교차검증 (누수 없는 버전) ====================
+def cv_tree(df, y, cols, folds, spw=None):
+    """
+    ① 누수 제거 핵심:
+       - tr을 tr_in(학습) + es_in(early stopping 검증)으로 다시 분리
+       - early stopping은 es_in으로만 판단
+       - va(진짜 검증 fold)는 예측에만 사용, 학습·조기종료에 절대 안 씀
+    """
+    X = df[cols].replace([np.inf, -np.inf], np.nan)
+    oof = np.zeros(len(y)); imps = []; fold_aucs = []
+    for k, (tr, va) in enumerate(folds, 1):
+        tr_in, es_in = train_test_split(
+            tr, test_size=ES_SIZE, random_state=RANDOM_STATE + k,
+            stratify=y[tr])
+        params = dict(TREE_PARAMS)
+        if spw is not None:
+            params["scale_pos_weight"] = spw
+        m = lgb.LGBMClassifier(**params, random_state=RANDOM_STATE + k)
+        m.fit(X.iloc[tr_in], y[tr_in],
+              eval_set=[(X.iloc[es_in], y[es_in])], eval_metric="auc",
+              callbacks=[lgb.early_stopping(EARLY_STOP, verbose=False)])
+        pred_va = m.predict_proba(X.iloc[va])[:, 1]
+        oof[va] = pred_va
+        fold_aucs.append(roc_auc_score(y[va], pred_va))
+        imps.append(pd.Series(m.feature_importances_, index=cols))
+    return (oof, roc_auc_score(y, oof),
+            pd.concat(imps, axis=1).mean(axis=1), np.array(fold_aucs))
+
+
+# ==================== 메인 ====================
+def main():
+    print("데이터 로드 & 병합...")
+    df, A, B, C = load_and_merge()
+    if SAMPLE_N:
+        df = df.sample(SAMPLE_N, random_state=1).reset_index(drop=True)
+    y = df[TARGET].values
+    spw = ((y == 0).sum() / (y == 1).sum()) if USE_SCALE_POS_WEIGHT else None
+    print(f"  병합 완료: {len(df):,}행, 부도율 {y.mean():.2%}")
+    print(f"  A(금융) {len(A)} / B(전통비금융) {len(B)} / C(신규비금융) {len(C)}")
+    print(f"  누수제거: ON | scale_pos_weight: "
+          f"{'ON('+format(spw,'.2f')+')' if spw else 'OFF'} | importance: gain\n")
+
+    # 모델 정의: M1=A, M2=B(참고), M3=A+B
+    specs = {
+        "M1_금융":       A,
+        "M2_비금융단독":  B,
+        "M3_금융+비금융": A + B,
+    }
+    folds = list(StratifiedKFold(N_FOLDS, shuffle=True,
+                                 random_state=RANDOM_STATE).split(df, y))
+
+    oof, auc, imp, fstd = {}, {}, {}, {}
+    for name, cols in specs.items():
+        oof[name], auc[name], imp[name], fa = cv_tree(df, y, cols, folds, spw)
+        fstd[name] = fa.std()
+        print(f"  {name:20s} n={len(cols):3d}  AUC={auc[name]:.5f}  "
+              f"(fold편차 {fstd[name]:.5f})")
+
+    # RQ1: M3(A+B) vs M1(A)
+    d1, p1 = delong(y, oof["M3_금융+비금융"], oof["M1_금융"])
+    print("\n" + "=" * 62)
+    print(f"RQ1 (M3 vs M1) 비금융 추가효과   ΔAUC={d1:+.5f}  p={p1:.2e}  "
+          f"{'유의' if p1 < 0.05 else '비유의'}")
+    print(f"참고: M2(비금융단독) AUC={auc['M2_비금융단독']:.5f} "
+          f"— 비금융만으로의 예측력 (비교 기준 아님)")
+    print("=" * 62)
+
+    # 저장
+    pd.DataFrame([{"모델": n, "변수수": len(specs[n]),
+                   "AUC": round(auc[n], 5), "fold표준편차": round(fstd[n], 5)}
+                  for n in specs]).to_csv("results_M1_M3_fixed.csv", index=False,
+                                          encoding="utf-8-sig")
+    pd.DataFrame([
+        {"비교": "RQ1 (M3-M1) 비금융 추가효과", "ΔAUC": round(d1, 5),
+         "DeLong_p": p1, "유의성": "유의" if p1 < 0.05 else "비유의"},
+    ]).to_csv("delong_M1_M3_fixed.csv", index=False, encoding="utf-8-sig")
+    imp["M3_금융+비금융"].sort_values(ascending=False).to_csv(
+        "importance_M3_fixed.csv", encoding="utf-8-sig")
+
+    print("\n저장: results_M1_M3_fixed.csv, delong_M1_M3_fixed.csv, "
+          "importance_M3_fixed.csv")
+    print("\nM3 변수중요도(gain) 상위 10:")
+    print(imp["M3_금융+비금융"].sort_values(ascending=False).head(10).round(0).to_string())
+
+
+if __name__ == "__main__":
+    main()
